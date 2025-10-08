@@ -2,13 +2,13 @@ package com.huadis;
 
 import org.yaml.snakeyaml.Yaml;
 
-import java.io.*;
+import java.io.BufferedReader;
+import java.io.FileNotFoundException;
+import java.io.FileReader;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.SQLException;
-import java.sql.Statement;
+import java.sql.*;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -51,6 +51,7 @@ public class SQLScriptExecutor {
         private String password;
         private String driverClass = getDriver("mysql");
         private String scriptPath;
+        private String checkTable;
 
         // Getters
         public String getDbType() {
@@ -75,6 +76,10 @@ public class SQLScriptExecutor {
 
         public String getScriptPath() {
             return scriptPath;
+        }
+
+        public String getCheckTable() {
+            return checkTable;
         }
 
         // Setters
@@ -106,6 +111,10 @@ public class SQLScriptExecutor {
             this.scriptPath = scriptPath;
         }
 
+        public void setCheckTable(String checkTable) {
+            this.checkTable = checkTable;
+        }
+
         @Override
         public String toString() {
             return "DbConfig{\n" +
@@ -115,6 +124,7 @@ public class SQLScriptExecutor {
                     "  password='" + password + "'\n" +
                     "  driverClass='" + driverClass + "'\n" +
                     "  scriptPath='" + scriptPath + "'\n" +
+                    "  checkTable='" + checkTable + "'\n" +
                     "}";
         }
     }
@@ -129,16 +139,18 @@ public class SQLScriptExecutor {
 
         try {
             // Determine configuration source: YAML file or command-line arguments
-            if (args.length == 1 && (args[0].endsWith(".yml") || args[0].endsWith(".yaml"))) {
-                // Load configuration from YAML file
-                System.out.println("Loading configuration from YAML file: " + args[0]);
-                config = loadConfigFromYaml(args[0]);
-            } else if (args.length == 2 && (args[0].endsWith(".yml") || args[0].endsWith(".yaml"))) {
+            if (args.length == 2 && (args[0].endsWith(".yml") || args[0].endsWith(".yaml"))) {
                 // Load configuration from YAML file
                 System.out.println("Loading configuration from YAML file: " + args[0]);
                 config = loadConfigFromYaml(args[0]);
                 config.setScriptPath(args[1]);
-            } else if (args.length == 5) {
+            } else if (args.length == 3 && (args[0].endsWith(".yml") || args[0].endsWith(".yaml"))) {
+                // Load configuration from YAML file
+                System.out.println("Loading configuration from YAML file: " + args[0]);
+                config = loadConfigFromYaml(args[0]);
+                config.setScriptPath(args[1]);
+                config.setCheckTable(args[2]);
+            } else if (args.length >= 5) {
                 // Load configuration from command-line arguments
                 System.out.println("Loading configuration from command-line arguments");
                 config = createConfigFromArgs(args);
@@ -146,12 +158,36 @@ public class SQLScriptExecutor {
                 printUsage();
                 return;
             }
-            System.out.println("SQLConfig: " + config);
+
+            System.out.println("Using configuration:");
+            System.out.println(config);
+
             // Validate configuration
             if (!validateConfig(config)) {
                 System.err.println("Invalid configuration parameters");
                 return;
             }
+
+            // Check if table exists
+            if (config.getCheckTable() != null && !config.getCheckTable().trim().isEmpty()) {
+                try (Connection conn = DriverManager.getConnection(
+                        config.getJdbcUrl(),
+                        config.getUsername(),
+                        config.getPassword())) {
+
+                    boolean tableExists = checkTableExistence(conn, config.getDbType(), config.getCheckTable());
+
+                    if (tableExists) {
+                        System.out.println("Table '" + config.getCheckTable() + "' already exists. Skipping script execution.");
+                        return;
+                    } else {
+                        System.out.println("Table '" + config.getCheckTable() + "' does not exist. Proceeding with script execution.");
+                    }
+                }
+            } else {
+                System.out.println("No check table specified. Proceeding with script execution.");
+            }
+
 
             // Execute SQL script with the configuration
             executeScript(config);
@@ -177,7 +213,14 @@ public class SQLScriptExecutor {
         config.setUsername(args[2]);
         config.setPassword(args[3]);
         config.setScriptPath(args[4]);
-        config.setDriverClass(null);
+        if (args.length == 6) {
+            config.setCheckTable(args[5]);
+        }
+        if (args.length == 7) {
+            config.setDriverClass(args[6]);
+        } else {
+            config.setDriverClass(null);
+        }
         return config;
     }
 
@@ -200,9 +243,6 @@ public class SQLScriptExecutor {
         config.setJdbcUrl((String) dbConfigMap.get("url"));
         config.setUsername((String) dbConfigMap.get("username"));
         config.setPassword((String) dbConfigMap.get("password"));
-        config.setDriverClass((String) dbConfigMap.get("driver"));
-        config.setScriptPath((String) dbConfigMap.get("scriptPath"));
-
 
         return config;
     }
@@ -218,13 +258,75 @@ public class SQLScriptExecutor {
 
         // Check required fields
         if (config.getDbType() == null || config.getJdbcUrl() == null ||
-                config.getUsername() == null || config.getDriverClass() == null ||
-                config.getScriptPath() == null) {
+                config.getUsername() == null || config.getPassword() == null ||
+                config.getDriverClass() == null || config.getScriptPath() == null) {
             return false;
         }
 
         // Check supported database types
         return config.getDbType().equals("mysql") || config.getDbType().equals("pgsql");
+    }
+
+    /**
+     * Checks if a table exists in the database
+     */
+    private static boolean checkTableExistence(Connection conn, String dbType, String tableName) throws SQLException {
+        // Remove any quotes from table name if present
+        tableName = tableName.replaceAll("^[\"']|[\"']$", "");
+
+        switch (dbType.toLowerCase()) {
+            case "mysql":
+            case "mysql5":
+            case "mysql8":
+                return checkMySqlTableExistence(conn, tableName);
+            case "pgsql":
+                return checkPostgresTableExistence(conn, tableName);
+            default:
+                throw new SQLException("Unsupported database type for table check: " + dbType);
+        }
+    }
+
+    /**
+     * Checks table existence for MySQL databases
+     */
+    private static boolean checkMySqlTableExistence(Connection conn, String tableName) throws SQLException {
+        String[] parts = tableName.split("\\.");
+        String schema = null;
+        String table = tableName;
+
+        // Handle schema.table format
+        if (parts.length == 2) {
+            schema = parts[0];
+            table = parts[1];
+        } else {
+            // Get current schema if not specified
+            schema = conn.getCatalog();
+        }
+
+        try (ResultSet rs = conn.getMetaData().getTables(
+                schema, null, table, new String[]{"TABLE"})) {
+            return rs.next();
+        }
+    }
+
+    /**
+     * Checks table existence for PostgreSQL databases
+     */
+    private static boolean checkPostgresTableExistence(Connection conn, String tableName) throws SQLException {
+        String[] parts = tableName.split("\\.");
+        String schema = "public"; // Default PostgreSQL schema
+        String table = tableName;
+
+        // Handle schema.table format
+        if (parts.length == 2) {
+            schema = parts[0];
+            table = parts[1];
+        }
+
+        try (ResultSet rs = conn.getMetaData().getTables(
+                null, schema, table, new String[]{"TABLE"})) {
+            return rs.next();
+        }
     }
 
     /**
@@ -340,9 +442,9 @@ public class SQLScriptExecutor {
      */
     private static void printUsage() {
         System.out.println("Usage 1 (Command-line arguments):");
-        System.out.println("java SQLScriptExecutor <dbType> <jdbcUrl> <username> <password> <scriptPath>");
+        System.out.println("java SQLScriptExecutor <dbType> <jdbcUrl> <username> <password> <scriptPath> <checkTable> <driverClass>");
         System.out.println("\nUsage 2 (YAML configuration file):");
-        System.out.println("java SQLScriptExecutor <path_to_config.yml>");
+        System.out.println("java SQLScriptExecutor <path_to_config.yml> <scriptPath> <checkTable>");
         System.out.println("\nExample YAML configuration:");
         System.out.println("database:");
         System.out.println("  type: mysql");
@@ -351,5 +453,6 @@ public class SQLScriptExecutor {
         System.out.println("  password: password");
         System.out.println("  driver: com.mysql.cj.jdbc.Driver");
         System.out.println("  scriptPath: ./script.sql");
+        System.out.println("  checkTable: t_version");
     }
 }
